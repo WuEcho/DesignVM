@@ -1,0 +1,215 @@
+From 93f691a1374a0620685130246742076be762cbaf Mon Sep 17 00:00:00 2001
+From: WuEcho <emailforecho@163.com>
+Date: Fri, 20 Oct 2023 16:17:15 +0800
+Subject: [PATCH] add interface method & start go routine update database
+
+---
+ process/process.go    | 118 +++++++++++++++++++++---------------------
+ vm/ethvm/interface.go |   5 ++
+ 2 files changed, 64 insertions(+), 59 deletions(-)
+
+diff --git a/process/process.go b/process/process.go
+index 3b62fdf..0d35977 100644
+--- a/process/process.go
++++ b/process/process.go
+@@ -4,6 +4,7 @@ import (
+ 	"context"
+ 	"fmt"
+ 	"github.com/CaduceusMetaverseProtocol/MetaNebula/common/log"
++	"github.com/CaduceusMetaverseProtocol/MetaNebula/core/globaldb"
+ 	types2 "github.com/CaduceusMetaverseProtocol/MetaNebula/types"
+ 	basev1 "github.com/CaduceusMetaverseProtocol/MetaProtocol/gen/proto/go/base/v1"
+ 	metatypes "github.com/CaduceusMetaverseProtocol/MetaTypes/types"
+@@ -138,12 +139,6 @@ func (p *Processor) ExecBenchTxs(block *types.Block, statedb interfaces.StateDB,
+ 		defer pprof.StopCPUProfile()
+ 	}
+ 	timeStart := time.Now()
+-	//cpuProfile := fmt.Sprintf(cpuProfilePath+"/pprof.samples.cpu.0%d-1.pb", block.NumberU64())
+-	//f1, err := os.Create(cpuProfile)
+-	//if err != nil {
+-	//	log.Infof("ExecBenchTxs create cpu profile failed err %s", err.Error())
+-	//}
+-	//pprof.StartCPUProfile(f1)
+ 
+ 	cache := transcut.NewMarkCache()
+ 	fee := block.Header().BaseFee
+@@ -207,15 +202,7 @@ func (p *Processor) ExecBenchTxs(block *types.Block, statedb interfaces.StateDB,
+ 		}
+ 		timeUsed1 := time.Since(timeStart1)
+ 		log.Info("ExecBenchTxs----FillUpPoolWithTask", "time used:", timeUsed1.String())
+-		//pprof.StopCPUProfile()
+-
+ 
+-		//cpuProfile = fmt.Sprintf(cpuProfilePath+"/pprof.samples.cpu.0%d-2.pb", block.NumberU64())
+-		//f2, err := os.Create(cpuProfile)
+-		//if err != nil {
+-		//	log.Infof("ExecBenchTxs create cpu profile failed err %s", err.Error())
+-		//}
+-		//pprof.StartCPUProfile(f2)
+ 		timeStart2 := time.Now()
+ 		rwSet := NewCacheSet(len(tepRes))
+ 		for _, result := range tepRes {
+@@ -232,20 +219,10 @@ func (p *Processor) ExecBenchTxs(block *types.Block, statedb interfaces.StateDB,
+ 		sort.Sort(rwSet)
+ 		timeUsed2 := time.Since(timeStart2)
+ 		log.Info("ExecBenchTxs----set cache", "time used:", timeUsed2.String())
+-		//pprof.StopCPUProfile()
+-
+ 
+-		//////对读写集进行检查冲突
+-		//cpuProfile = fmt.Sprintf(cpuProfilePath+"/pprof.samples.cpu.0%d-3.pb", block.NumberU64())
+-		//f3, err := os.Create(cpuProfile)
+-		//if err != nil {
+-		//	log.Infof("ExecBenchTxs create cpu profile failed err %s", err.Error())
+-		//}
+-		//pprof.StartCPUProfile(f3)
+ 		timeStart3 := time.Now()
+ 		wCache := NewWrittenBefore(1000)
+ 		reses, _ := DetectConflicts(rwSet, cache, wCache, results, statedb, *blockContext, cfg, p.config, gp, usedGas, i)
+-		//pprof.StopCPUProfile()
+ 		timeUsed3 := time.Since(timeStart3)
+ 		log.Info("ExecBenchTxs----FindClashWithReadAndWriteCache", "time used:", timeUsed3.String())
+ 		results = reses
+@@ -502,58 +479,81 @@ func UpdateWrittenCacheToDataBaseInOrder(res *Result, statedb interfaces.StateDB
+ 	return statedb
+ }
+ 
++type objectChan struct {
++	acc     types2.Account
++	object  *globaldb.StateObject
++	cache   map[metatypes.Hash]interface{}
++}
++
+ func UpdateWrittenCacheToDataBase(w *WrittenBefore, statedb interfaces.StateDB) interfaces.StateDB {
+-	//var wg sync.WaitGroup
++	var wg sync.WaitGroup
++	mapLegth := len(w.Written)
++	objChan := make(chan *objectChan,mapLegth)
+ 	for addr, cache := range w.Written {
+-		//wg.Add(1)
+-		//go func(innerAddr metatypes.Address, innerCache map[metatypes.Hash]interface{}) {
+-		//	defer wg.Done()
++		wg.Add(1)
++		go func(innerAddr metatypes.Address, innerCache map[metatypes.Hash]interface{},stateDb interfaces.StateDB) {
++			defer wg.Done()
+ 			account := types2.Account{
+-				addr,
++				innerAddr,
+ 			}
+-			_, ok := cache[ethvm.CreatAccountKey]
+-			if ok {
+-				statedb.CreateAccount(account)
+-				statedb.SetNonce(account, 1)
++			obj := statedb.GetStateObject(account)
++			objChan <- &objectChan{
++				acc: account,
++				object: obj,
++				cache: innerCache,
+ 			}
++		}(addr, cache, statedb)
++	}
++	wg.Wait()
++	counter := 0
++	for  {
++		select {
++		case obj,ok := <- objChan:
++			if ok{
++				valueCache := obj.cache
++				account := obj.acc
+ 
+-			code, ok := cache[ethvm.SetCodeKey]
+-			if ok {
+-				statedb.SetCode(account, code.([]byte))
+-			}
+ 
+-			v, ok := cache[ethvm.BalanceKey]
+-			if ok {
+-				statedb.SetBalance(account, v.(*big.Int))
+-			}
++				_,ok := valueCache[ethvm.CreatAccountKey]
++				if ok {
++					statedb.CreateAccount(account)
++					statedb.SetNonce(account,1)
++				}
++
++				bal,ok := valueCache[ethvm.BalanceKey]
++				if ok {
++					obj.object.SetBalance(bal.(*big.Int))
++				}
+ 
+-			for k, v := range cache {
+-				switch k {
+-				case ethvm.BalanceKey:
+-				case ethvm.CreatAccountKey:
+-				case ethvm.SetCodeKey:
+-				case ethvm.NonceKey:
+-					statedb.SetNonce(account, v.(uint64))
+-				case ethvm.SubBalanceKey:
+-					statedb.SubBalance(account, v.(*big.Int))
+-				default:
+-					statedb.SetState(account, k, common2.ByteToHash(v.([]byte)))
++				for k,v := range valueCache{
++					switch k {
++					case ethvm.BalanceKey:
++					case ethvm.CreatAccountKey:
++					case ethvm.SetCodeKey:
++					case ethvm.NonceKey:
++						obj.object.SetNonce(v.(uint64))
++					case ethvm.SubBalanceKey:
++						balance := obj.object.GetBalance()
++						r := new(big.Int).Sub(balance, v.(*big.Int))
++						obj.object.SetBalance(r)
++					default:
++						obj.object.SetState(statedb.GetDb(),k,common2.ByteToHash(v.([]byte)))
++					}
+ 				}
++				counter++
+ 			}
++		}
+ 
+-		//}(addr, cache)
++		if counter == mapLegth {
++			break
++		}
+ 	}
+-	//wg.Wait()
++
+ 	//log.Info("UpdateWrittenCacheToDataBase----","accountNum：",accountNum,"creatAccount:",creatAccount,"setBalanceCount：",setBalanceCount,"setNonceCount:",setNonceCount,"subBalanceCount:",subBalanceCount)
+ 	for txHash, logs := range w.Logs {
+-		//wg.Add(1)
+-		//go func(innHash metatypes.Hash,innerLogs []*basev1.MetaTxLog) {
+-		//	defer wg.Done()
+ 			for _, log := range logs {
+ 				statedb.AddLogWithTxHash(log, txHash)
+ 			}
+-		//}(txHash,logs)
+ 	}
+-	//wg.Wait()
+ 	return statedb
+ }
+diff --git a/vm/ethvm/interface.go b/vm/ethvm/interface.go
+index 2b4488d..ae97695 100644
+--- a/vm/ethvm/interface.go
++++ b/vm/ethvm/interface.go
+@@ -1,6 +1,7 @@
+ package ethvm
+ 
+ import (
++	"github.com/CaduceusMetaverseProtocol/MetaNebula/core/globaldb"
+ 	types2 "github.com/CaduceusMetaverseProtocol/MetaNebula/types"
+ 	basev1 "github.com/CaduceusMetaverseProtocol/MetaProtocol/gen/proto/go/base/v1"
+ 	"math/big"
+@@ -69,6 +70,10 @@ type StateDB interface {
+ 	AddPreimage(metatypes.Hash, []byte)
+ 
+ 	ForEachStorage(metatypes.Address, func(common.Hash, common.Hash) bool) error
++
++	GetStateObject(account types2.Account) *globaldb.StateObject
++
++	GetDb() globaldb.Database
+ }
+ 
+ // CallContext provides a basic interface for the VM calling conventions. The VM
+-- 
+2.27.0
+
